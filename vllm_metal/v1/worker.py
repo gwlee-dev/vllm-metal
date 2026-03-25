@@ -284,7 +284,7 @@ class MetalWorker(WorkerBase):
                 n_patched,
                 num_blocks,
                 block_size,
-                latent_dim,
+                runner.mla_latent_dim,
             )
         else:
             logger.info(
