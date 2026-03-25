@@ -682,6 +682,19 @@ class MetalModelRunner:
         """
         return "kv_lora_rank" in self.model_args
 
+    @property
+    def mla_latent_dim(self) -> int:
+        """Combined latent dimension for MLA cache: kv_lora_rank + qk_rope_head_dim.
+
+        Only valid when is_mla is True. Derived directly from model_args so
+        callers do not depend on the _resolve_model_dims head_dim override.
+        """
+        if not self.is_mla:
+            raise AttributeError("mla_latent_dim is only valid for MLA models")
+        return int(self.model_args["kv_lora_rank"]) + int(
+            self.model_args.get("qk_rope_head_dim", _MLA_DEFAULT_QK_ROPE_HEAD_DIM)
+        )
+
     def should_setup_paged_attention(self) -> bool:
         """Whether worker-side paged-attention setup should run.
 
@@ -908,8 +921,8 @@ class MetalModelRunner:
 
         # MLA (GLM/DeepSeek lineage): cache stores a joint latent vector per
         # layer, not per-head K/V. One virtual head sized kv_lora_rank +
-        # qk_rope_head_dim keeps get_cache_block_size_bytes() correct without
-        # MLA-specific logic in the sizing path.
+        # qk_rope_head_dim keeps get_cache_block_size_bytes() conservative (2x)
+        # without MLA-specific logic in the sizing path. See todo item 3.
         if self.is_mla:
             self.num_kv_heads = 1
             self.head_dim = int(args["kv_lora_rank"]) + int(

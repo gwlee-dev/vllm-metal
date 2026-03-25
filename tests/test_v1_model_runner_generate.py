@@ -146,6 +146,7 @@ class TestResolveModelDims:
         r._resolve_model_dims()
         assert r.num_kv_heads == 1
         assert r.head_dim == 576  # 512 + 64
+        assert r.mla_latent_dim == 576
 
     def test_mla_default_rope_head_dim(self) -> None:
         r = self._make_runner(
@@ -158,6 +159,20 @@ class TestResolveModelDims:
         )
         r._resolve_model_dims()
         assert r.head_dim == 320  # 256 + default 64
+        assert r.mla_latent_dim == 320  # default qk_rope_head_dim applied
+
+    def test_mla_latent_dim_does_not_require_resolve_model_dims(self) -> None:
+        r = self._make_runner(
+            {
+                "num_hidden_layers": 4,
+                "num_attention_heads": 8,
+                "hidden_size": 512,
+                "kv_lora_rank": 512,
+                "qk_rope_head_dim": 64,
+            }
+        )
+
+        assert r.mla_latent_dim == 576
 
     def test_missing_dims_raise(self) -> None:
         r = self._make_runner({"num_hidden_layers": 32})
