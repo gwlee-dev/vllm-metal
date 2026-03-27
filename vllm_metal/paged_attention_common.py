@@ -144,25 +144,6 @@ def find_attn_attr(layer: Any) -> str | None:
     return None
 
 
-def find_layers_and_attr(model: Any) -> tuple[list[Any], str]:
-    """Find transformer layers and the attention attribute name.
-
-    Returns (layer_list, attn_attr_name) where each layer has
-    getattr(layer, attn_attr_name) pointing to the attention module.
-
-    .. deprecated::
-        Use :func:`find_layers` + :func:`find_attn_attr` for hybrid models
-        where different layers may use different attribute names.
-    """
-    layer_list = find_layers(model)
-    if layer_list:
-        attr = find_attn_attr(layer_list[0])
-        if attr is not None:
-            return layer_list, attr
-        raise ValueError(f"Cannot find attention module in layer {type(layer_list[0])}")
-    return layer_list, "self_attn"
-
-
 # ---------------------------------------------------------------------------
 # Prepare functions — called before each forward pass
 # ---------------------------------------------------------------------------
