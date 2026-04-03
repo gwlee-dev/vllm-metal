@@ -1678,7 +1678,8 @@ class MetalModelRunner:
             if state is None:
                 logger.warning(
                     "Paged cached request %s has no RequestState; "
-                    "emitting placeholder token. This is a state tracking bug.",
+                    "emitting placeholder token. This indicates scheduler/runner "
+                    "state desync.",
                     req_id,
                 )
                 batch.add_output(req_id, [0])
