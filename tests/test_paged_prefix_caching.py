@@ -291,6 +291,35 @@ def _make_cached_scheduler_output(
     )
 
 
+class TestCachedRequestBlockUpdates:
+    def test_resumed_request_replaces_blocks_and_resets_prefill_state(self):
+        runner = _make_paged_runner()
+        runner._request_states["req-1"] = mr.RequestState(
+            token_ids=[10, 20, 30, 40, 50],
+            prompt_len=4,
+            cache=[],
+            sampling_params=_greedy_sp(),
+            generator=None,
+            generated_tokens=1,
+            block_ids=[0, 1],
+        )
+        runner._paged_request_seq_lens["req-1"] = 5
+
+        cached_reqs = SimpleNamespace(
+            req_ids=["req-1"],
+            new_block_ids=[([7, 8],)],
+            resumed_req_ids={"req-1"},
+            num_computed_tokens=[4],
+        )
+
+        runner._update_cached_request_blocks(cached_reqs)
+
+        state = runner._request_states["req-1"]
+        assert state.block_ids == [7, 8]
+        assert state.generated_tokens == 0
+        assert "req-1" not in runner._paged_request_seq_lens
+
+
 class TestMixedDecodeAndPrefixHitPrefill:
     """Verify a decode request and a prefix-hit prefill in the same unified step."""
 

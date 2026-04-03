@@ -38,7 +38,12 @@ from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    GrammarOutput,
+    NewRequestData,
+    SchedulerOutput,
+)
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.logits_processor import build_logitsprocs
@@ -493,6 +498,41 @@ class PrefillRequest(NamedTuple):
     prompt_len: int | None  # full prompt length (None for intermediate chunks)
     start_pos: int  # RoPE / slot offset (0 = fresh, >0 = continuation)
     full_prompt_token_ids: list[int] | None  # full prompt for sampling metadata
+
+
+@dataclass
+class _PendingPrefillEntry:
+    """Paged prefill work plus the metadata needed for post-processing."""
+
+    output_idx: int
+    prefill: PrefillRequest
+    result_mode: Literal["intermediate", "new_final", "cached_final"]
+
+
+@dataclass
+class _ExecutionBatch:
+    """Typed accumulator for one ``execute_model()`` call."""
+
+    req_ids: list[str] = field(default_factory=list)
+    req_id_to_index: dict[str, int] = field(default_factory=dict)
+    sampled_tokens: list[list[int]] = field(default_factory=list)
+    new_reqs_by_id: dict[str, NewRequestData] = field(default_factory=dict)
+    paged_prefill_entries: list[_PendingPrefillEntry] = field(default_factory=list)
+    paged_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
+    scheduled_cached_req_ids: list[str] = field(default_factory=list)
+    valid_decode_reqs: list[tuple[str, RequestState]] = field(default_factory=list)
+
+    def add_output(self, req_id: str, token_ids: list[int]) -> int:
+        """Append one output slot and return its index."""
+        self.req_ids.append(req_id)
+        output_idx = len(self.req_ids) - 1
+        self.req_id_to_index[req_id] = output_idx
+        self.sampled_tokens.append(token_ids)
+        return output_idx
+
+    def has_paged_work(self) -> bool:
+        """Return whether this step has any paged execution work."""
+        return bool(self.paged_prefill_entries or self.paged_decode_reqs)
 
 
 def _merge_kv_caches(
@@ -1513,98 +1553,54 @@ class MetalModelRunner:
 
         return prefill_next_tokens, decode_next_tokens
 
-    def execute_model(
-        self, scheduler_output: SchedulerOutput
-    ) -> ModelRunnerOutput | None:
-        """Execute model inference with true batched decode.
+    def _handle_new_requests(
+        self,
+        batch: _ExecutionBatch,
+        new_reqs: list[NewRequestData],
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Register new requests and execute any required per-request prefill."""
+        batch.new_reqs_by_id = {req.req_id: req for req in new_reqs}
 
-        Key optimization: Uses BatchKVCache.merge() to combine individual
-        KV caches and run a SINGLE forward pass for all decode requests.
-
-        Args:
-            scheduler_output: Scheduler output with batch information
-
-        Returns:
-            Model runner output with generated tokens
-        """
-        if self.model is None:
-            raise RuntimeError("Model not loaded")
-
-        if self._is_stt:
-            return self._execute_stt(scheduler_output)
-
-        # Collect all requests to process
-        req_ids: list[str] = []
-        req_id_to_index: dict[str, int] = {}
-        sampled_tokens: list[list[int]] = []
-
-        # === Collect all requests into one unified batch ===
-        new_reqs = scheduler_output.scheduled_new_reqs
-        new_reqs_by_id = {r.req_id: r for r in new_reqs}
-        cached_reqs = scheduler_output.scheduled_cached_reqs
-
-        # Paged-attention entries collected for the single unified forward.
-        # Each prefill entry: (output_idx, req_id, token_ids, sampling_params,
-        #                      block_ids, generator, is_new, is_intermediate,
-        #                      prompt_len, start_pos)
-        paged_prefill_entries: list[
-            tuple[
-                int,
-                str,
-                list[int],
-                SamplingParams,
-                list[int],
-                torch.Generator | None,
-                bool,
-                bool,
-                int,
-                int,
-            ]
-        ] = []
-        paged_decode_reqs: list[tuple[str, RequestState]] = []
-
-        # --- New requests ---
         for new_req in new_reqs:
             req_id = new_req.req_id
             token_ids = new_req.prompt_token_ids or []
             sampling_params = new_req.sampling_params or SamplingParams()
 
-            req_ids.append(req_id)
-            output_idx = len(req_ids) - 1
-            req_id_to_index[req_id] = output_idx
-
             if not token_ids:
-                sampled_tokens.append([0])
+                batch.add_output(req_id, [0])
                 continue
 
             generator = _create_request_generator(self.device, sampling_params)
 
             if self._paged_attention_backend is not None:
                 sched_block_ids = list(new_req.block_ids[0])
-                scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 computed_tokens = new_req.num_computed_tokens
                 prompt_len = len(token_ids)
                 cur_len = computed_tokens + scheduled_tokens
                 is_intermediate = cur_len < prompt_len
+                output_idx = batch.add_output(req_id, [])
 
-                sampled_tokens.append([])  # placeholder
-                paged_prefill_entries.append(
-                    (
-                        output_idx,
-                        req_id,
-                        token_ids[computed_tokens:cur_len],
-                        sampling_params,
-                        sched_block_ids,
-                        generator,
-                        True,  # is_new
-                        is_intermediate,
-                        prompt_len,
-                        computed_tokens,  # start_pos / RoPE offset
+                batch.paged_prefill_entries.append(
+                    _PendingPrefillEntry(
+                        output_idx=output_idx,
+                        prefill=PrefillRequest(
+                            req_id=req_id,
+                            token_ids=token_ids[computed_tokens:cur_len],
+                            sampling_params=sampling_params,
+                            block_ids=sched_block_ids,
+                            generator=generator,
+                            prompt_len=prompt_len if not is_intermediate else None,
+                            start_pos=computed_tokens,
+                            full_prompt_token_ids=None,
+                        ),
+                        result_mode="intermediate" if is_intermediate else "new_final",
                     )
                 )
 
-                # Create state immediately for intermediate chunks
-                # (needed if the request appears as cached next step).
+                # Intermediate chunks need RequestState immediately so a cached
+                # continuation in the next step can find the request.
                 if is_intermediate:
                     self._request_states[req_id] = RequestState(
                         token_ids=list(token_ids),
@@ -1615,306 +1611,319 @@ class MetalModelRunner:
                         generated_tokens=0,
                         block_ids=sched_block_ids,
                     )
-            else:
-                next_token, cache = self._prefill_single(
-                    req_id,
-                    token_ids,
-                    sampling_params,
-                    generator=generator,
-                )
-                sampled_tokens.append([next_token])
-                self._request_states[req_id] = RequestState(
-                    token_ids=list(token_ids) + [next_token],
-                    prompt_len=len(token_ids),
-                    cache=cache,
-                    sampling_params=sampling_params,
-                    generator=generator,
-                    generated_tokens=1,
-                    block_ids=[],
-                )
+                continue
 
-        # --- Cached requests ---
-        decode_req_ids = list(cached_reqs.req_ids)
-
-        if decode_req_ids:
-            if self._paged_attention_backend is not None:
-                req_id_to_cached_idx = {
-                    rid: i for i, rid in enumerate(cached_reqs.req_ids)
-                }
-
-                # Update block_ids from scheduler (append or replace on resume)
-                for i, req_id in enumerate(cached_reqs.req_ids):
-                    state = self._request_states.get(req_id)
-                    if state is None:
-                        continue
-                    new_block_ids = cached_reqs.new_block_ids[i]
-                    resumed = req_id in cached_reqs.resumed_req_ids
-
-                    if not resumed:
-                        if new_block_ids is not None:
-                            state.block_ids.extend(new_block_ids[0])
-                    else:
-                        assert new_block_ids is not None
-                        state.block_ids = list(new_block_ids[0])
-                        state.generated_tokens = 0
-                        self._paged_request_seq_lens.pop(req_id, None)
-
-                # Categorise each cached request
-                for req_id in decode_req_ids:
-                    state = self._request_states.get(req_id)
-                    if state is None:
-                        # Placeholder keeps the output tensor aligned; the warning surfaces the bug.
-                        logger.warning(
-                            "Paged cached request %s has no RequestState; "
-                            "emitting placeholder token. This is a state tracking bug.",
-                            req_id,
-                        )
-                        req_ids.append(req_id)
-                        req_id_to_index[req_id] = len(req_ids) - 1
-                        sampled_tokens.append([0])
-                        continue
-
-                    if state.generated_tokens == 0:
-                        # Still prefilling (or re-prefilling after preemption)
-                        idx = req_id_to_cached_idx.get(req_id)
-                        if idx is not None and idx < len(
-                            cached_reqs.num_computed_tokens
-                        ):
-                            computed = cached_reqs.num_computed_tokens[idx]
-                        else:
-                            computed = self._paged_request_seq_lens.get(req_id, 0)
-                        scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-                        target_len = computed + scheduled
-                        is_intermediate = target_len < len(state.token_ids)
-
-                        req_ids.append(req_id)
-                        output_idx = len(req_ids) - 1
-                        req_id_to_index[req_id] = output_idx
-                        sampled_tokens.append([])  # placeholder
-
-                        paged_prefill_entries.append(
-                            (
-                                output_idx,
-                                req_id,
-                                state.token_ids[computed:target_len],
-                                state.sampling_params,
-                                state.block_ids,
-                                state.generator,
-                                False,  # is_new
-                                is_intermediate,
-                                state.prompt_len,
-                                computed,  # start_pos / RoPE offset
-                            )
-                        )
-                    else:
-                        paged_decode_reqs.append((req_id, state))
-            else:
-                # Non-paged (MLX) path — unchanged
-                valid_decode_reqs = []
-                for req_id in decode_req_ids:
-                    state = self._request_states.get(req_id)
-                    if state is not None:
-                        valid_decode_reqs.append((req_id, state))
-
-                if valid_decode_reqs:
-                    if len(valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING:
-                        decode_tokens = self._batched_decode(valid_decode_reqs)
-                    else:
-                        decode_tokens = self._sequential_decode(valid_decode_reqs)
-
-                    for i, (req_id, _) in enumerate(valid_decode_reqs):
-                        req_ids.append(req_id)
-                        req_id_to_index[req_id] = len(req_ids) - 1
-                        sampled_tokens.append([decode_tokens[i]])
-
-                for req_id in decode_req_ids:
-                    if req_id not in req_id_to_index:
-                        req_ids.append(req_id)
-                        req_id_to_index[req_id] = len(req_ids) - 1
-                        sampled_tokens.append([0])
-
-        # === Single unified forward pass (paged path) ===
-        if paged_prefill_entries or paged_decode_reqs:
-            prefill_pack: list[PrefillRequest] = []
-            for (
-                _,
-                rid,
-                tids,
-                sp,
-                bids,
-                gen,
-                _is_new,
-                is_intermediate,
-                prompt_len,
-                start_pos,
-            ) in paged_prefill_entries:
-                # Full prompt for sampling metadata (needed when token_ids
-                # is a suffix slice due to prefix cache hit).
-                # State exists for cached requests (intermediate chunks);
-                # new requests with a prefix hit look up from new_reqs_by_id.
-                state = self._request_states.get(rid)
-                if start_pos == 0:
-                    full_prompt = None
-                elif state is not None:
-                    full_prompt = state.token_ids[: state.prompt_len]
-                else:
-                    req = new_reqs_by_id.get(rid)
-                    if req is None:
-                        raise RuntimeError(
-                            f"Prefix cache hit (start_pos={start_pos}) for request "
-                            f"{rid!r} but it has no RequestState and is not in "
-                            "new_reqs. This is a state tracking bug."
-                        )
-                    full_prompt = list(req.prompt_token_ids)
-                prefill_pack.append(
-                    PrefillRequest(
-                        req_id=rid,
-                        token_ids=tids,
-                        sampling_params=sp,
-                        block_ids=bids,
-                        generator=gen,
-                        prompt_len=prompt_len if not is_intermediate else None,
-                        start_pos=start_pos,
-                        full_prompt_token_ids=full_prompt,
-                    )
-                )
-            prefill_tokens, decode_tokens = self._unified_prefill_decode_paged(
-                prefill_pack, paged_decode_reqs
+            next_token, cache = self._prefill_single(
+                req_id,
+                token_ids,
+                sampling_params,
+                generator=generator,
+            )
+            batch.add_output(req_id, [next_token])
+            self._request_states[req_id] = RequestState(
+                token_ids=list(token_ids) + [next_token],
+                prompt_len=len(token_ids),
+                cache=cache,
+                sampling_params=sampling_params,
+                generator=generator,
+                generated_tokens=1,
+                block_ids=[],
             )
 
-            # Post-process prefill results
-            for i, (
-                idx,
-                rid,
-                tids,
-                sp,
-                bids,
-                gen,
-                is_new,
-                is_intermediate,
-                _prompt_len,
-                _start_pos,
-            ) in enumerate(paged_prefill_entries):
-                nt = prefill_tokens[i]
+    def _update_cached_request_blocks(
+        self,
+        cached_reqs: CachedRequestData,
+    ) -> None:
+        """Apply scheduler-provided block updates for paged cached requests."""
+        if self._paged_attention_backend is None:
+            return
 
-                if is_intermediate:
-                    # KV cache populated; discard sampled token
-                    sampled_tokens[idx] = []
-                elif is_new:
-                    sampled_tokens[idx] = [nt]
-                    cached_full_prompt = prefill_pack[i].full_prompt_token_ids
-                    full_prompt = (
-                        cached_full_prompt if cached_full_prompt is not None else tids
-                    )
-                    self._request_states[rid] = RequestState(
-                        token_ids=full_prompt + [nt],
-                        prompt_len=_prompt_len,
-                        cache=[],
-                        sampling_params=sp,
-                        generator=gen,
-                        generated_tokens=1,
-                        block_ids=bids,
-                    )
-                else:
-                    # Cached last chunk — append token to existing state
-                    sampled_tokens[idx] = [nt]
-                    state = self._request_states[rid]
-                    state.token_ids.append(nt)
-                    state.generated_tokens = len(state.token_ids) - state.prompt_len
+        for i, req_id in enumerate(cached_reqs.req_ids):
+            state = self._request_states.get(req_id)
+            if state is None:
+                continue
 
-            # Post-process decode results
-            for i, (req_id, _) in enumerate(paged_decode_reqs):
-                req_ids.append(req_id)
-                req_id_to_index[req_id] = len(req_ids) - 1
-                sampled_tokens.append([decode_tokens[i]])
+            new_block_ids = cached_reqs.new_block_ids[i]
+            resumed = req_id in cached_reqs.resumed_req_ids
+            if not resumed:
+                if new_block_ids is not None:
+                    state.block_ids.extend(new_block_ids[0])
+                continue
 
-        # Consistency check: every scheduled request must be represented in
-        # req_ids, and decode-phase scheduled requests should not emit empty
-        # token lists. Missing/empty outputs here can leave placeholders stale.
-        if scheduler_output.total_num_scheduled_tokens > 0:
-            missing_req_ids: list[str] = []
-            unexpected_empty_req_ids: list[str] = []
-            for req_id in scheduler_output.num_scheduled_tokens:
-                idx = req_id_to_index.get(req_id)
-                if idx is None:
-                    missing_req_ids.append(req_id)
-                    continue
-                if sampled_tokens[idx]:
-                    continue
+            assert new_block_ids is not None
+            state.block_ids = list(new_block_ids[0])
+            state.generated_tokens = 0
+            self._paged_request_seq_lens.pop(req_id, None)
 
-                # The only valid empty-output case is an intermediate
-                # prefill chunk (generated_tokens == 0 means still
-                # prefilling).
+    def _collect_cached_requests(
+        self,
+        batch: _ExecutionBatch,
+        cached_reqs: CachedRequestData,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Classify cached requests into prefill continuation or decode work."""
+        if not cached_reqs.req_ids:
+            return
+
+        if self._paged_attention_backend is None:
+            batch.scheduled_cached_req_ids.extend(cached_reqs.req_ids)
+            for req_id in cached_reqs.req_ids:
                 state = self._request_states.get(req_id)
-                is_intermediate_ctx = state is not None and state.generated_tokens == 0
-                # Also check PHASE 1 intermediate chunks
-                if not is_intermediate_ctx:
-                    new_req = new_reqs_by_id.get(req_id)
-                    if new_req is not None:
-                        prompt_len = len(new_req.prompt_token_ids or [])
-                        computed = new_req.num_computed_tokens
-                        scheduled = scheduler_output.num_scheduled_tokens.get(req_id, 0)
-                        is_intermediate_ctx = computed + scheduled < prompt_len
-
-                if not is_intermediate_ctx:
-                    unexpected_empty_req_ids.append(req_id)
-
-            if missing_req_ids or unexpected_empty_req_ids:
-                logger.error(
-                    "ModelRunner scheduled/output mismatch: scheduled=%d emitted=%d "
-                    "missing=%d unexpected_empty=%d",
-                    len(scheduler_output.num_scheduled_tokens),
-                    len(req_ids),
-                    len(missing_req_ids),
-                    len(unexpected_empty_req_ids),
-                )
-                if missing_req_ids:
-                    logger.error("Missing scheduled req ids: %s", missing_req_ids[:16])
-                if unexpected_empty_req_ids:
-                    logger.error(
-                        "Unexpected empty outputs for req ids: %s",
-                        unexpected_empty_req_ids[:16],
-                    )
-
-        # === PHASE 3: Clean up finished requests ===
-        if scheduler_output.finished_req_ids:
-            for req_id in scheduler_output.finished_req_ids:
-                state = self._request_states.pop(req_id, None)
                 if state is not None:
-                    if state.cache:
-                        del state.cache
-                    del state
+                    batch.valid_decode_reqs.append((req_id, state))
+            return
 
-                # Clean up paged attention tracking state.
-                # Block freeing is handled by the scheduler's kv_cache_manager.
-                self._paged_request_seq_lens.pop(req_id, None)
+        for idx, req_id in enumerate(cached_reqs.req_ids):
+            state = self._request_states.get(req_id)
+            if state is None:
+                logger.warning(
+                    "Paged cached request %s has no RequestState; "
+                    "emitting placeholder token. This indicates scheduler/runner "
+                    "state desync.",
+                    req_id,
+                )
+                batch.add_output(req_id, [0])
+                continue
 
-            # Lazy cache clearing - only clear periodically to avoid sync overhead
-            self._finished_request_count += len(scheduler_output.finished_req_ids)
-            if self._finished_request_count >= _CACHE_CLEAR_INTERVAL:
-                mx.clear_cache()
-                self._finished_request_count = 0
+            if state.generated_tokens == 0:
+                computed_tokens = cached_reqs.num_computed_tokens[idx]
+                scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                target_len = computed_tokens + scheduled_tokens
+                is_intermediate = target_len < len(state.token_ids)
+                output_idx = batch.add_output(req_id, [])
 
-                # Log prefix cache stats periodically
-                if self._prefix_cache is not None:
-                    stats = self._prefix_cache.get_stats()
-                    logger.info(
-                        "Prefix cache: %.1f%% hit rate "
-                        "(hits=%d, misses=%d, cached=%d, "
-                        "%.1fMB/%.1fMB)",
-                        stats["hit_rate"] * 100,
-                        stats["hits"],
-                        stats["misses"],
-                        stats["cached_entries"],
-                        stats["current_bytes"] / (1024 * 1024),
-                        stats["max_bytes"] / (1024 * 1024),
+                batch.paged_prefill_entries.append(
+                    _PendingPrefillEntry(
+                        output_idx=output_idx,
+                        prefill=PrefillRequest(
+                            req_id=req_id,
+                            token_ids=state.token_ids[computed_tokens:target_len],
+                            sampling_params=state.sampling_params,
+                            block_ids=state.block_ids,
+                            generator=state.generator,
+                            prompt_len=(
+                                state.prompt_len if not is_intermediate else None
+                            ),
+                            start_pos=computed_tokens,
+                            full_prompt_token_ids=None,
+                        ),
+                        result_mode=(
+                            "intermediate" if is_intermediate else "cached_final"
+                        ),
+                    )
+                )
+                continue
+
+            batch.paged_decode_reqs.append((req_id, state))
+
+    def _build_prefill_pack(
+        self,
+        batch: _ExecutionBatch,
+    ) -> list[PrefillRequest]:
+        """Reconstruct full prompt context for paged prefill requests."""
+        prefill_pack: list[PrefillRequest] = []
+        for entry in batch.paged_prefill_entries:
+            prefill = entry.prefill
+            full_prompt = None
+
+            if prefill.start_pos > 0:
+                state = self._request_states.get(prefill.req_id)
+                if state is not None:
+                    full_prompt = state.token_ids[: state.prompt_len]
+                else:
+                    new_req = batch.new_reqs_by_id.get(prefill.req_id)
+                    if new_req is None:
+                        raise RuntimeError(
+                            f"Prefix cache hit (start_pos={prefill.start_pos}) for "
+                            f"request {prefill.req_id!r} but it has no RequestState "
+                            "and is not in new_reqs. This is a state tracking bug."
+                        )
+                    prompt_token_ids = new_req.prompt_token_ids
+                    if prompt_token_ids is None:
+                        raise RuntimeError(
+                            f"Prefix cache hit (start_pos={prefill.start_pos}) for "
+                            f"request {prefill.req_id!r} but prompt_token_ids is "
+                            "missing. This is a scheduler contract bug."
+                        )
+                    full_prompt = list(prompt_token_ids)
+
+            prefill_pack.append(
+                PrefillRequest(
+                    req_id=prefill.req_id,
+                    token_ids=prefill.token_ids,
+                    sampling_params=prefill.sampling_params,
+                    block_ids=prefill.block_ids,
+                    generator=prefill.generator,
+                    prompt_len=prefill.prompt_len,
+                    start_pos=prefill.start_pos,
+                    full_prompt_token_ids=full_prompt,
+                )
+            )
+
+        return prefill_pack
+
+    def _run_paged_batch(
+        self,
+        batch: _ExecutionBatch,
+        prefill_pack: list[PrefillRequest],
+    ) -> None:
+        """Run paged prefill/decode and write results back into ``batch``."""
+        prefill_tokens, decode_tokens = self._unified_prefill_decode_paged(
+            prefill_pack, batch.paged_decode_reqs
+        )
+
+        for i, entry in enumerate(batch.paged_prefill_entries):
+            next_token = prefill_tokens[i]
+            prefill = prefill_pack[i]
+
+            if entry.result_mode == "intermediate":
+                batch.sampled_tokens[entry.output_idx] = []
+                continue
+
+            batch.sampled_tokens[entry.output_idx] = [next_token]
+            if entry.result_mode == "new_final":
+                prompt_len = prefill.prompt_len
+                assert prompt_len is not None
+                full_prompt = (
+                    prefill.full_prompt_token_ids
+                    if prefill.full_prompt_token_ids is not None
+                    else prefill.token_ids
+                )
+                self._request_states[prefill.req_id] = RequestState(
+                    token_ids=full_prompt + [next_token],
+                    prompt_len=prompt_len,
+                    cache=[],
+                    sampling_params=prefill.sampling_params,
+                    generator=prefill.generator,
+                    generated_tokens=1,
+                    block_ids=prefill.block_ids,
+                )
+                continue
+
+            state = self._request_states[prefill.req_id]
+            state.token_ids.append(next_token)
+            state.generated_tokens = len(state.token_ids) - state.prompt_len
+
+        for i, (req_id, _) in enumerate(batch.paged_decode_reqs):
+            batch.add_output(req_id, [decode_tokens[i]])
+
+    def _run_non_paged_decode_batch(
+        self,
+        batch: _ExecutionBatch,
+    ) -> None:
+        """Run non-paged decode work and append placeholder outputs as needed."""
+        if batch.valid_decode_reqs:
+            if len(batch.valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING:
+                decode_tokens = self._batched_decode(batch.valid_decode_reqs)
+            else:
+                decode_tokens = self._sequential_decode(batch.valid_decode_reqs)
+
+            for i, (req_id, _) in enumerate(batch.valid_decode_reqs):
+                batch.add_output(req_id, [decode_tokens[i]])
+
+        for req_id in batch.scheduled_cached_req_ids:
+            if req_id not in batch.req_id_to_index:
+                batch.add_output(req_id, [0])
+
+    def _validate_scheduled_outputs(
+        self,
+        batch: _ExecutionBatch,
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Check that every scheduled request has a valid output slot."""
+        if scheduler_output.total_num_scheduled_tokens <= 0:
+            return
+
+        missing_req_ids: list[str] = []
+        unexpected_empty_req_ids: list[str] = []
+        for req_id in scheduler_output.num_scheduled_tokens:
+            output_idx = batch.req_id_to_index.get(req_id)
+            if output_idx is None:
+                missing_req_ids.append(req_id)
+                continue
+
+            if batch.sampled_tokens[output_idx]:
+                continue
+
+            state = self._request_states.get(req_id)
+            is_intermediate_ctx = state is not None and state.generated_tokens == 0
+            if not is_intermediate_ctx:
+                new_req = batch.new_reqs_by_id.get(req_id)
+                if new_req is not None:
+                    prompt_len = len(new_req.prompt_token_ids or [])
+                    computed_tokens = new_req.num_computed_tokens
+                    scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                    is_intermediate_ctx = (
+                        computed_tokens + scheduled_tokens < prompt_len
                     )
 
-        # Handle empty case — return directly so the batch-queue path in
-        # step_with_batch_queue receives a non-None result from the
-        # execute_model future (when model_executed=False, sample_tokens is
-        # never called, so _pending_output would go unconsumed).
-        if not req_ids:
+            if not is_intermediate_ctx:
+                unexpected_empty_req_ids.append(req_id)
+
+        if missing_req_ids or unexpected_empty_req_ids:
+            logger.error(
+                "ModelRunner scheduled/output mismatch: scheduled=%d emitted=%d "
+                "missing=%d unexpected_empty=%d",
+                len(scheduler_output.num_scheduled_tokens),
+                len(batch.req_ids),
+                len(missing_req_ids),
+                len(unexpected_empty_req_ids),
+            )
+            if missing_req_ids:
+                logger.error("Missing scheduled req ids: %s", missing_req_ids[:16])
+            if unexpected_empty_req_ids:
+                logger.error(
+                    "Unexpected empty outputs for req ids: %s",
+                    unexpected_empty_req_ids[:16],
+                )
+
+    def _cleanup_finished_requests(
+        self,
+        finished_req_ids: set[str],
+    ) -> None:
+        """Evict finished request state and periodically clear MLX cache."""
+        if not finished_req_ids:
+            return
+
+        for req_id in finished_req_ids:
+            state = self._request_states.pop(req_id, None)
+            if state is not None:
+                if state.cache:
+                    del state.cache
+                del state
+
+            # Block freeing is handled by the scheduler's kv_cache_manager.
+            self._paged_request_seq_lens.pop(req_id, None)
+
+        self._finished_request_count += len(finished_req_ids)
+        if self._finished_request_count < _CACHE_CLEAR_INTERVAL:
+            return
+
+        mx.clear_cache()
+        self._finished_request_count = 0
+
+        if self._prefix_cache is None:
+            return
+
+        stats = self._prefix_cache.get_stats()
+        logger.info(
+            "Prefix cache: %.1f%% hit rate "
+            "(hits=%d, misses=%d, cached=%d, "
+            "%.1fMB/%.1fMB)",
+            stats["hit_rate"] * 100,
+            stats["hits"],
+            stats["misses"],
+            stats["cached_entries"],
+            stats["current_bytes"] / (1024 * 1024),
+            stats["max_bytes"] / (1024 * 1024),
+        )
+
+    def _finalize_output(
+        self,
+        batch: _ExecutionBatch,
+    ) -> ModelRunnerOutput | None:
+        """Store execute-time output for ``sample_tokens()`` or return empty."""
+        if not batch.req_ids:
             return ModelRunnerOutput(
                 req_ids=[],
                 req_id_to_index={},
@@ -1925,14 +1934,43 @@ class MetalModelRunner:
             )
 
         self._pending_output = ModelRunnerOutput(
-            req_ids=req_ids,
-            req_id_to_index=req_id_to_index,
-            sampled_token_ids=sampled_tokens,
+            req_ids=batch.req_ids,
+            req_id_to_index=batch.req_id_to_index,
+            sampled_token_ids=batch.sampled_tokens,
             logprobs=None,
             prompt_logprobs_dict={},
-            pooler_output=[None] * len(req_ids),
+            pooler_output=[None] * len(batch.req_ids),
         )
         return None
+
+    def execute_model(
+        self, scheduler_output: SchedulerOutput
+    ) -> ModelRunnerOutput | None:
+        """Execute model inference with true batched decode."""
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+
+        if self._is_stt:
+            return self._execute_stt(scheduler_output)
+
+        batch = _ExecutionBatch()
+        self._handle_new_requests(
+            batch, scheduler_output.scheduled_new_reqs, scheduler_output
+        )
+
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        self._update_cached_request_blocks(cached_reqs)
+        self._collect_cached_requests(batch, cached_reqs, scheduler_output)
+
+        if self._paged_attention_backend is not None and batch.has_paged_work():
+            prefill_pack = self._build_prefill_pack(batch)
+            self._run_paged_batch(batch, prefill_pack)
+        elif self._paged_attention_backend is None:
+            self._run_non_paged_decode_batch(batch)
+
+        self._validate_scheduled_outputs(batch, scheduler_output)
+        self._cleanup_finished_requests(scheduler_output.finished_req_ids)
+        return self._finalize_output(batch)
 
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
