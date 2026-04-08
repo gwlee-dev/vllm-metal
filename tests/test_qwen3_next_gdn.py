@@ -86,16 +86,12 @@ class TestGDNFreeSlotZeroing:
         mx.eval(*sc.conv_states, *sc.recurrent_states)
 
         # Slot 0 should be zeros
-        assert mx.allclose(
-            sc.conv_states[0][0], mx.zeros((3, 64), dtype=mx.float16)
-        )
+        assert mx.allclose(sc.conv_states[0][0], mx.zeros((3, 64), dtype=mx.float16))
         assert mx.allclose(
             sc.recurrent_states[0][0], mx.zeros((4, 16, 16), dtype=mx.float32)
         )
         # Slot 1 should still be ones
-        assert mx.allclose(
-            sc.conv_states[0][1], mx.ones((3, 64), dtype=mx.float16)
-        )
+        assert mx.allclose(sc.conv_states[0][1], mx.ones((3, 64), dtype=mx.float16))
         assert mx.allclose(
             sc.recurrent_states[0][1], mx.ones((4, 16, 16), dtype=mx.float32)
         )
@@ -229,7 +225,7 @@ class TestQwen3NextGolden:
         text = output.outputs[0].text
 
         expected = GOLDEN_MLX[prompt]
-        matched = token_ids[:len(expected)] == expected
+        matched = token_ids[: len(expected)] == expected
 
         print(f"\n  prompt: {prompt!r}")
         print(f"  output: {text!r}")
