@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Linear attention (Gated DeltaNet) with C++ Metal kernel for paged state.
+"""Linear attention (Gated DeltaNet) with mx.fast.metal_kernel for paged state.
 
 Decomposes the mlx_lm GDN module's forward pass and replaces the recurrent
-update step with a C++ nanobind Metal kernel that reads/writes state in-place
-from a managed pool via slot_mapping.
+update step with an mx.fast.metal_kernel that operates on gathered state
+slices from a paged pool via slot_mapping.
+
+The kernel participates in MLX's lazy evaluation graph — no explicit mx.eval
+barriers are needed in the forward path.  State is gathered from the pool
+before the kernel and scattered back afterward, both as lazy MLX ops.
 
 Conv1d remains per-request (stateful), but the expensive recurrent step is
 dispatched as a single batched Metal kernel call across all requests.
@@ -17,9 +21,117 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.gated_delta import compute_g
 
-from vllm_metal.metal import get_ops
 from vllm_metal.mlx_backend.gdn_cache import GDNPagedStateCache
 from vllm_metal.paged_attention_common import get_context
+
+
+# ---------------------------------------------------------------------------
+# mx.fast.metal_kernel for paged GDN recurrent update
+# ---------------------------------------------------------------------------
+def _make_paged_gdn_kernel() -> mx.fast.metal_kernel | None:
+    """Build an mx.fast.metal_kernel for the paged GDN recurrent update.
+
+    Ported from gdn_linear_attention.metal with adaptations:
+    - Functional state (state_in / state_out) instead of in-place pool mutation
+    - cu_seqlens for packed variable-length sequences
+    - Thread layout matching mlx_lm: grid=(32, Dv, num_requests*Hv),
+      threadgroup=(32, 4, 1)
+    """
+    if not mx.metal.is_available():
+        return None
+
+    source = """
+        // Thread mapping (matches mlx_lm gated_delta pattern)
+        auto n = thread_position_in_grid.z;
+        auto req_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // Per-request sequence boundaries from cu_seqlens
+        const int seq_start = cu_seqlens[req_idx];
+        const int seq_end   = cu_seqlens[req_idx + 1];
+        const int seq_len   = seq_end - seq_start;
+
+        // Packed tensor pointers (no batch dim, tokens concatenated)
+        // q, k: [total_tokens, Hk, Dk]
+        auto q_ = q + seq_start * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + seq_start * Hk * Dk + hk_idx * Dk;
+
+        // v, y: [total_tokens, Hv, Dv]
+        auto v_ = v + seq_start * Hv * Dv + hv_idx * Dv;
+        auto y_ = y + seq_start * Hv * Dv + hv_idx * Dv;
+
+        // state_in, state_out: [num_requests, Hv, Dv, Dk]
+        // (gathered from pool before kernel, scattered back after)
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        // Load state into registers
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        // g: [total_tokens, Hv]  (scalar gating)
+        auto g_ = g + seq_start * Hv;
+        auto beta_ = beta + seq_start * Hv;
+
+        // Recurrence loop (identical math to mlx_lm gated_delta)
+        for (int t = 0; t < seq_len; ++t) {
+            float g_val = static_cast<float>(g_[hv_idx]);
+
+            float kv_mem = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] * g_val;
+                kv_mem += state[i] * static_cast<float>(k_[s_idx]);
+            }
+            kv_mem = simd_sum(kv_mem);
+
+            auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem)
+                         * static_cast<float>(beta_[hv_idx]);
+
+            float out = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
+                out += state[i] * static_cast<float>(q_[s_idx]);
+            }
+            out = simd_sum(out);
+            if (thread_index_in_simdgroup == 0) {
+                y_[dv_idx] = static_cast<InT>(out);
+            }
+
+            // Advance to next token
+            q_ += Hk * Dk;
+            k_ += Hk * Dk;
+            v_ += Hv * Dv;
+            y_ += Hv * Dv;
+            g_ += Hv;
+            beta_ += Hv;
+        }
+
+        // Write state back
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            o_state[s_idx] = static_cast<StT>(state[i]);
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name="paged_gdn_linear_attention",
+        input_names=["q", "k", "v", "g", "beta", "state_in", "cu_seqlens"],
+        output_names=["y", "state_out"],
+        source=source,
+    )
+
+
+_paged_gdn_kernel = _make_paged_gdn_kernel()
 
 
 def is_linear_attention(module: nn.Module) -> bool:
@@ -159,7 +271,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         g = compute_g(inner.A_log, a, inner.dt_bias).astype(x.dtype)
         beta = mx.sigmoid(b).astype(x.dtype)
 
-        # === Step 5: C++ Metal kernel — batched recurrent update ===
+        # === Step 5: Lazy Metal kernel — batched recurrent update ===
         n_hk = inner.num_k_heads
         n_hv = inner.num_v_heads
         d_k = inner.head_k_dim
@@ -169,11 +281,11 @@ class GDNPagedAttentionWrapper(nn.Module):
         # Use float32 for kernel dispatch to avoid float16 overflow in
         # recurrent state accumulation.  Output is cast back after.
         kernel_dtype = mx.float32
-        q_flat = mx.contiguous(q.reshape(total_tokens, n_hk, d_k).astype(kernel_dtype))
-        k_flat = mx.contiguous(k.reshape(total_tokens, n_hk, d_k).astype(kernel_dtype))
-        v_flat = mx.contiguous(v.reshape(total_tokens, n_hv, d_v).astype(kernel_dtype))
-        g_flat = mx.contiguous(g.reshape(total_tokens, n_hv).astype(kernel_dtype))
-        beta_flat = mx.contiguous(beta.reshape(total_tokens, n_hv).astype(kernel_dtype))
+        q_flat = q.reshape(total_tokens, n_hk, d_k).astype(kernel_dtype)
+        k_flat = k.reshape(total_tokens, n_hk, d_k).astype(kernel_dtype)
+        v_flat = v.reshape(total_tokens, n_hv, d_v).astype(kernel_dtype)
+        g_flat = g.reshape(total_tokens, n_hv).astype(kernel_dtype)
+        beta_flat = beta.reshape(total_tokens, n_hv).astype(kernel_dtype)
 
         cu_seqlens_arr = mx.array(cu_seqlens, dtype=mx.int32)
         # Stable request → slot mapping from model_runner's allocator.
@@ -182,38 +294,42 @@ class GDNPagedAttentionWrapper(nn.Module):
         else:
             slot_mapping = mx.arange(num_requests, dtype=mx.int32)
 
-        y_flat = mx.zeros((total_tokens, n_hv, d_v), dtype=kernel_dtype)
+        # Gather state from paged pool (lazy)
         recurrent_pool = state_cache.recurrent_states[cache_idx]
+        state_in = recurrent_pool[slot_mapping]  # [num_requests, Hv, Dv, Dk]
 
-        mx.eval(
-            q_flat,
-            k_flat,
-            v_flat,
-            g_flat,
-            beta_flat,
-            recurrent_pool,
-            cu_seqlens_arr,
-            slot_mapping,
-            y_flat,
+        # Dispatch lazy kernel — no mx.eval barriers
+        y_flat, state_out = _paged_gdn_kernel(
+            inputs=[
+                q_flat,
+                k_flat,
+                v_flat,
+                g_flat,
+                beta_flat,
+                state_in,
+                cu_seqlens_arr,
+            ],
+            template=[
+                ("InT", kernel_dtype),
+                ("StT", mx.float32),
+                ("Dk", d_k),
+                ("Dv", d_v),
+                ("Hk", n_hk),
+                ("Hv", n_hv),
+            ],
+            grid=(32, d_v, num_requests * n_hv),
+            threadgroup=(32, 4, 1),
+            output_shapes=[
+                (total_tokens, n_hv, d_v),
+                (num_requests, n_hv, d_v, d_k),
+            ],
+            output_dtypes=[kernel_dtype, mx.float32],
         )
 
-        ops = get_ops()
-        ops.gdn_linear_attention(
-            q_flat,
-            k_flat,
-            v_flat,
-            g_flat,
-            beta_flat,
-            recurrent_pool,
-            cu_seqlens_arr,
-            slot_mapping,
-            y_flat,
-            n_hk,
-            n_hv,
-            d_k,
-            d_v,
-        )
-        mx.eval(y_flat, recurrent_pool)
+        # Scatter state back to paged pool (lazy)
+        recurrent_pool[slot_mapping] = state_out
+        state_cache.recurrent_states[cache_idx] = recurrent_pool
+
         y_flat = y_flat.astype(x.dtype)
 
         # === Step 6: Output norm + projection ===

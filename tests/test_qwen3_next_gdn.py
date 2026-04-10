@@ -276,6 +276,149 @@ class TestGDNAllocSlotZeroing:
         assert slot1 == 0
 
 
+class TestPagedGDNKernel:
+    """Verify the mx.fast.metal_kernel GDN dispatch."""
+
+    def test_multi_request_variable_seqlen(self):
+        """Packed multi-request input with variable seq lengths."""
+        from vllm_metal.metal_kernel_backend.attention_linear import (
+            _paged_gdn_kernel,
+        )
+
+        n_hk, n_hv, d_k, d_v = 4, 4, 64, 32
+        seq_lens = [3, 5, 2]
+        num_requests = len(seq_lens)
+        total_tokens = sum(seq_lens)
+        cu_seqlens = [0]
+        for s in seq_lens:
+            cu_seqlens.append(cu_seqlens[-1] + s)
+
+        mx.random.seed(123)
+        q = mx.random.normal((total_tokens, n_hk, d_k)).astype(mx.float32)
+        k = mx.random.normal((total_tokens, n_hk, d_k)).astype(mx.float32)
+        v = mx.random.normal((total_tokens, n_hv, d_v)).astype(mx.float32)
+        g = mx.random.uniform(shape=(total_tokens, n_hv)).astype(mx.float32)
+        beta = mx.random.uniform(shape=(total_tokens, n_hv)).astype(mx.float32)
+        state_in = (
+            mx.random.normal((num_requests, n_hv, d_v, d_k)).astype(mx.float32) * 0.1
+        )
+        cu_arr = mx.array(cu_seqlens, dtype=mx.int32)
+        mx.eval(q, k, v, g, beta, state_in, cu_arr)
+
+        y, state_out = _paged_gdn_kernel(
+            inputs=[q, k, v, g, beta, state_in, cu_arr],
+            template=[
+                ("InT", mx.float32),
+                ("StT", mx.float32),
+                ("Dk", d_k),
+                ("Dv", d_v),
+                ("Hk", n_hk),
+                ("Hv", n_hv),
+            ],
+            grid=(32, d_v, num_requests * n_hv),
+            threadgroup=(32, 4, 1),
+            output_shapes=[
+                (total_tokens, n_hv, d_v),
+                (num_requests, n_hv, d_v, d_k),
+            ],
+            output_dtypes=[mx.float32, mx.float32],
+        )
+        mx.eval(y, state_out)
+
+        assert y.shape == (total_tokens, n_hv, d_v)
+        assert state_out.shape == (num_requests, n_hv, d_v, d_k)
+        # Output must be non-zero (non-trivial computation happened)
+        assert y.abs().sum().item() > 0
+        assert state_out.abs().sum().item() > 0
+
+    def test_state_pool_scatter_isolation(self):
+        """Scatter back to pool must update only the target slots."""
+        from vllm_metal.metal_kernel_backend.attention_linear import (
+            _paged_gdn_kernel,
+        )
+
+        n_hk, n_hv, d_k, d_v = 4, 4, 64, 32
+        total_tokens = 2
+        num_requests = 1
+        max_seqs = 4
+
+        mx.random.seed(456)
+        q = mx.random.normal((total_tokens, n_hk, d_k)).astype(mx.float32)
+        k = mx.random.normal((total_tokens, n_hk, d_k)).astype(mx.float32)
+        v = mx.random.normal((total_tokens, n_hv, d_v)).astype(mx.float32)
+        g = mx.ones((total_tokens, n_hv), dtype=mx.float32) * 0.9
+        beta = mx.ones((total_tokens, n_hv), dtype=mx.float32) * 0.5
+        cu_arr = mx.array([0, total_tokens], dtype=mx.int32)
+        slot_mapping = mx.array([2], dtype=mx.int32)  # use slot 2
+
+        # Pool with ones everywhere
+        pool = mx.ones((max_seqs, n_hv, d_v, d_k), dtype=mx.float32)
+        mx.eval(pool)
+
+        state_in = pool[slot_mapping]  # gather slot 2
+        _, state_out = _paged_gdn_kernel(
+            inputs=[q, k, v, g, beta, state_in, cu_arr],
+            template=[
+                ("InT", mx.float32),
+                ("StT", mx.float32),
+                ("Dk", d_k),
+                ("Dv", d_v),
+                ("Hk", n_hk),
+                ("Hv", n_hv),
+            ],
+            grid=(32, d_v, num_requests * n_hv),
+            threadgroup=(32, 4, 1),
+            output_shapes=[
+                (total_tokens, n_hv, d_v),
+                (num_requests, n_hv, d_v, d_k),
+            ],
+            output_dtypes=[mx.float32, mx.float32],
+        )
+
+        # Scatter back to pool
+        pool[slot_mapping] = state_out
+        mx.eval(pool)
+
+        # Slot 2 should be updated (different from ones)
+        ones = mx.ones((n_hv, d_v, d_k), dtype=mx.float32)
+        assert not mx.array_equal(pool[2], ones)
+        # Slots 0, 1, 3 should still be ones
+        assert mx.array_equal(pool[0], ones)
+        assert mx.array_equal(pool[1], ones)
+        assert mx.array_equal(pool[3], ones)
+
+    def test_conv1d_state_no_eval_between_requests(self):
+        """Conv state writes for request 0 must not corrupt request 1
+        when no mx.eval is called between them (lazy chain)."""
+        sc = GDNPagedStateCache(
+            num_layers=1,
+            max_seqs=2,
+            conv_kernel_dim=4,
+            conv_dim=16,
+            num_v_heads=2,
+            value_head_dim=8,
+            key_head_dim=8,
+            dtype=mx.float16,
+        )
+
+        # Write different values to slot 0 and slot 1 without intermediate eval
+        val0 = mx.ones((1, 3, 16), dtype=mx.float16) * 2.0
+        val1 = mx.ones((1, 3, 16), dtype=mx.float16) * 7.0
+
+        cs = sc.conv_states[0]
+        cs[0:1] = val0
+        sc.conv_states[0] = cs
+
+        cs = sc.conv_states[0]
+        cs[1:2] = val1
+        sc.conv_states[0] = cs
+
+        # Now eval and verify both slots independently correct
+        mx.eval(sc.conv_states[0])
+        assert mx.allclose(sc.conv_states[0][0], val0.squeeze(0))
+        assert mx.allclose(sc.conv_states[0][1], val1.squeeze(0))
+
+
 class TestSyncMLXInTensorBridge:
     """Verify sync_mlx is called before MPS tensor transfer."""
 

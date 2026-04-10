@@ -1523,8 +1523,20 @@ class MetalModelRunner:
         finally:
             clear_context()
 
-        # Submit to GPU — returns immediately, GPU runs in background
-        mx.async_eval(logits)
+        # Submit to GPU — returns immediately, GPU runs in background.
+        # GDN state writes (conv_states, recurrent_states) are side-effects
+        # outside the logits dependency graph.  They must be included in
+        # async_eval explicitly, otherwise they are silently dropped when
+        # the Python variables are rebound in the next forward pass.
+        if self.is_hybrid:
+            backend = self._paged_attention_backend
+            sc = getattr(backend, "_state_cache", None) if backend else None
+            if sc is not None:
+                mx.async_eval(logits, *sc.conv_states, *sc.recurrent_states)
+            else:
+                mx.async_eval(logits)
+        else:
+            mx.async_eval(logits)
 
         # ---- build cu_seqlens for logit extraction ----
         cu_seqlens: list[int] = [0]
