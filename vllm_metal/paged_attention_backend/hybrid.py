@@ -42,12 +42,16 @@ def _build_linear_layer_spec(
     key_head_dim: int,
     torch_dtype: torch.dtype,
     page_size_padded: int | None = None,
+    block_size: int = 1,
 ) -> MambaSpec:
     """Build a MambaSpec for one GDN linear attention layer.
 
     Args:
         page_size_padded: Optional padded page size from cache_config to
             align Mamba page size with attention page size in hybrid models.
+        block_size: Tokens per block.  Must match the SDPA block_size so
+            the scheduler's unified block pool can serve both layer types
+            without running out of blocks prematurely.
     """
     return MambaSpec(
         shapes=(
@@ -55,7 +59,7 @@ def _build_linear_layer_spec(
             (num_v_heads, value_head_dim, key_head_dim),
         ),
         dtypes=(torch_dtype, torch_dtype),
-        block_size=1,
+        block_size=block_size,
         page_size_padded=page_size_padded,
     )
 
