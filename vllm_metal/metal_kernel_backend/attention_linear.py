@@ -218,35 +218,61 @@ class GDNPagedAttentionWrapper(nn.Module):
             b = inner.in_proj_b(x)  # [1, total_tokens, Hv]
             a = inner.in_proj_a(x)  # [1, total_tokens, Hk]
 
-        # === Step 2: Conv1d (per-request, needs conv_state) ===
+        # === Step 2: Conv1d (batched for decode, per-request for prefill) ===
         # Use stable slot mapping for state pool access.
         slot_ids = (
             ctx.gdn_slot_mapping
             if ctx.gdn_slot_mapping is not None
             else list(range(num_requests))
         )
-        conv_outputs = []
-        for req_idx in range(num_requests):
-            slot = slot_ids[req_idx]
-            start = cu_seqlens[req_idx]
-            end = cu_seqlens[req_idx + 1]
-            req_qkv = mixed_qkv[:, start:end, :]
 
-            # Load conv state from stable slot
-            conv_state = state_cache.conv_states[cache_idx][slot : slot + 1]
-            conv_input = mx.concatenate([conv_state, req_qkv], axis=1)
+        # Check if all requests are decode (1 token each) — enables batching
+        all_decode = all(
+            cu_seqlens[i + 1] - cu_seqlens[i] == 1 for i in range(num_requests)
+        )
 
-            # Save updated conv state back to stable slot
-            new_conv = conv_input[:, -(inner.conv_kernel_size - 1) :]
-            cs = state_cache.conv_states[cache_idx]
-            cs[slot : slot + 1] = new_conv
-            state_cache.conv_states[cache_idx] = cs
-
+        if all_decode and num_requests > 1:
+            # Batched decode: gather states → concat → single conv1d → scatter
+            slot_mapping_conv = mx.array(slot_ids, dtype=mx.int32)
+            # gathered: [num_requests, conv_kernel_size-1, conv_dim]
+            gathered_states = state_cache.conv_states[cache_idx][slot_mapping_conv]
+            # mixed_qkv: [1, num_requests, conv_dim] → [num_requests, 1, conv_dim]
+            qkv_batch = mixed_qkv[0, :, :].reshape(num_requests, 1, -1)
+            # conv_input: [num_requests, conv_kernel_size, conv_dim]
+            conv_input = mx.concatenate([gathered_states, qkv_batch], axis=1)
+            # Save new conv state back
+            new_states = conv_input[:, -(inner.conv_kernel_size - 1) :]
+            pool = state_cache.conv_states[cache_idx]
+            pool[slot_mapping_conv] = new_states
+            state_cache.conv_states[cache_idx] = pool
+            # Single batched conv1d + silu
             conv_out = nn.silu(inner.conv1d(conv_input))
-            # Take only the output tokens (not the conv state prefix)
-            conv_outputs.append(conv_out[:, -(end - start) :, :])
+            # Take only output tokens: [num_requests, 1, conv_dim] → [1, num_requests, conv_dim]
+            conv_packed = conv_out[:, -1:, :].reshape(1, num_requests, -1)
+        else:
+            # Per-request loop (prefill with variable lengths, or single request)
+            conv_outputs = []
+            for req_idx in range(num_requests):
+                slot = slot_ids[req_idx]
+                start = cu_seqlens[req_idx]
+                end = cu_seqlens[req_idx + 1]
+                req_qkv = mixed_qkv[:, start:end, :]
 
-        conv_packed = mx.concatenate(conv_outputs, axis=1)
+                # Load conv state from stable slot
+                conv_state = state_cache.conv_states[cache_idx][slot : slot + 1]
+                conv_input = mx.concatenate([conv_state, req_qkv], axis=1)
+
+                # Save updated conv state back to stable slot
+                new_conv = conv_input[:, -(inner.conv_kernel_size - 1) :]
+                cs = state_cache.conv_states[cache_idx]
+                cs[slot : slot + 1] = new_conv
+                state_cache.conv_states[cache_idx] = cs
+
+                conv_out = nn.silu(inner.conv1d(conv_input))
+                # Take only the output tokens (not the conv state prefix)
+                conv_outputs.append(conv_out[:, -(end - start) :, :])
+
+            conv_packed = mx.concatenate(conv_outputs, axis=1)
 
         # === Step 3: Split Q/K/V + norm ===
         q, k, v = [
