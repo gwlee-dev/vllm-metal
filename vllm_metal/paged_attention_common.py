@@ -52,6 +52,10 @@ class PagedAttentionContext:
     # GDN state pool slot mapping: request batch position → stable slot ID.
     # Populated by model_runner for hybrid models; None for non-hybrid.
     gdn_slot_mapping: list[int] | None = None
+    # Pre-computed mx.array block indices per request.  Lazily populated by
+    # the first SDPA layer call, reused by subsequent layers to avoid
+    # redundant host-to-device copies.
+    blocks_mx: list | None = None
 
 
 def set_context(ctx: PagedAttentionContext) -> None:

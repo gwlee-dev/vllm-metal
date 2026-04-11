@@ -244,6 +244,17 @@ def sdpa_forward(
             out = out * mx.sigmoid(gate)
         return inner.o_proj(out)
 
+    # Pre-compute block index arrays once (first SDPA layer), reuse on
+    # subsequent layers.  Eliminates (num_layers-1) × num_requests redundant
+    # host-to-device mx.array constructions per forward pass.
+    if ctx.blocks_mx is None:
+        ctx.blocks_mx = []
+        for req_idx in range(num_requests):
+            ctx_len = ctx.context_lens[req_idx]
+            n_blocks = (ctx_len + kv_cache.block_size - 1) // kv_cache.block_size
+            block_ids = ctx.block_tables[req_idx]
+            ctx.blocks_mx.append(mx.array(block_ids[:n_blocks], dtype=mx.int32))
+
     outputs = []
     for req_idx in range(num_requests):
         req_start = ctx.cu_seqlens[req_idx]
@@ -255,9 +266,7 @@ def sdpa_forward(
         rq = queries[:, :, req_start:req_end, :]
 
         # Gather K/V from paged blocks into contiguous tensors
-        block_ids = ctx.block_tables[req_idx]
-        n_blocks = (ctx_len + kv_cache.block_size - 1) // kv_cache.block_size
-        blocks = mx.array(block_ids[:n_blocks], dtype=mx.int32)
+        blocks = ctx.blocks_mx[req_idx]
 
         gathered_k = new_k_cache[blocks].reshape(-1, kv_cache.num_kv_heads, head_dim)[
             :ctx_len
