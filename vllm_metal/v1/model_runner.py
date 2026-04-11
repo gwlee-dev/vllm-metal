@@ -1456,6 +1456,13 @@ class MetalModelRunner:
     # Unified prefill + decode (single forward pass)
     # ------------------------------------------------------------------
 
+    # Prefill chunk size: prompts larger than this are split into chunks
+    # with mx.eval barriers between them to prevent OOM from intermediate
+    # tensor accumulation.  Configurable via VLLM_METAL_PREFILL_CHUNK_SIZE.
+    _PREFILL_CHUNK_SIZE: int = int(
+        os.environ.get("VLLM_METAL_PREFILL_CHUNK_SIZE", "32768")
+    )
+
     def _start_paged_forward(
         self,
         batch: _ExecutionBatch,
@@ -1465,9 +1472,152 @@ class MetalModelRunner:
     ) -> None:
         """Build graph and submit forward pass to GPU (async).
 
+        If any prefill request exceeds ``_PREFILL_CHUNK_SIZE`` tokens, it
+        is split into chunks processed sequentially with ``mx.eval`` +
+        ``mx.clear_cache()`` barriers between chunks.  This frees FFN
+        intermediates (~14 GB/layer) and prevents Metal OOM on long
+        contexts (48K+).
+
         Stashes all state needed by ``sample_tokens`` in
         ``_execute_model_state`` (mirrors upstream's pattern).
         """
+        # Check if any prefill needs chunking
+        needs_chunking = any(
+            len(pr.token_ids) > self._PREFILL_CHUNK_SIZE for pr in prefill_reqs
+        )
+
+        if needs_chunking:
+            self._start_paged_forward_chunked(
+                batch, prefill_reqs, decode_reqs, scheduler_output
+            )
+            return
+
+        self._start_paged_forward_single(
+            batch, prefill_reqs, decode_reqs, scheduler_output
+        )
+
+    def _start_paged_forward_chunked(
+        self,
+        batch: _ExecutionBatch,
+        prefill_reqs: list[PrefillRequest],
+        decode_reqs: list[tuple[str, RequestState]],
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Chunked prefill: split large prefills into <=chunk_size pieces."""
+        chunk_size = self._PREFILL_CHUNK_SIZE
+
+        for pr_idx, pr in enumerate(prefill_reqs):
+            if len(pr.token_ids) <= chunk_size:
+                continue
+
+            token_ids = pr.token_ids
+            base_start_pos = pr.start_pos
+            processed = 0
+
+            # Process intermediate chunks (all but the last)
+            while len(token_ids) - processed > chunk_size:
+                chunk_tokens = token_ids[processed : processed + chunk_size]
+                chunk_start_pos = base_start_pos + processed
+
+                chunk_pr = PrefillRequest(
+                    req_id=pr.req_id,
+                    token_ids=chunk_tokens,
+                    sampling_params=pr.sampling_params,
+                    block_ids=pr.block_ids,
+                    generator=pr.generator,
+                    prompt_len=None,  # intermediate chunk
+                    start_pos=chunk_start_pos,
+                    full_prompt_token_ids=pr.full_prompt_token_ids,
+                )
+
+                # Run intermediate chunk synchronously (no decode requests)
+                self._run_intermediate_chunk([chunk_pr])
+                processed += chunk_size
+
+            # Replace original request with remainder for final chunk
+            remaining_tokens = token_ids[processed:]
+            remaining_start_pos = base_start_pos + processed
+            prefill_reqs[pr_idx] = PrefillRequest(
+                req_id=pr.req_id,
+                token_ids=remaining_tokens,
+                sampling_params=pr.sampling_params,
+                block_ids=pr.block_ids,
+                generator=pr.generator,
+                prompt_len=pr.prompt_len,
+                start_pos=remaining_start_pos,
+                full_prompt_token_ids=pr.full_prompt_token_ids,
+            )
+
+        # Final chunk: remaining prefill tokens + all decode requests (async)
+        self._start_paged_forward_single(
+            batch, prefill_reqs, decode_reqs, scheduler_output
+        )
+
+    def _run_intermediate_chunk(
+        self,
+        chunk_prefill_reqs: list[PrefillRequest],
+    ) -> None:
+        """Run a single intermediate prefill chunk synchronously.
+
+        Writes K/V to paged cache and GDN state, then forces evaluation
+        and frees intermediates.  No logit extraction or sampling.
+        """
+        all_token_ids: list[int] = []
+        for pr in chunk_prefill_reqs:
+            all_token_ids.extend(pr.token_ids)
+
+        prefill_info = [
+            (pr.block_ids, len(pr.token_ids), pr.start_pos) for pr in chunk_prefill_reqs
+        ]
+        prepare_unified([], prefill_info, self._paged_block_size)
+
+        # GDN slot mapping
+        if self.is_hybrid:
+            from vllm_metal.paged_attention_common import get_context
+
+            ctx = get_context()
+            if ctx is not None:
+                gdn_slots = [
+                    self._gdn_alloc_slot(pr.req_id) for pr in chunk_prefill_reqs
+                ]
+                ctx.gdn_slot_mapping = gdn_slots
+
+        # Forward pass (synchronous eval)
+        offset_caches = [OffsetCache(0) for _ in range(self.num_layers)]
+        input_ids = mx.array([all_token_ids], dtype=mx.int32)
+        try:
+            model_output = self.model(input_ids, cache=offset_caches)
+            # Eval model output + all cache arrays to materialize writes
+            kv = self._paged_attention_backend.kv_cache
+            if self.is_hybrid:
+                backend = self._paged_attention_backend
+                sc = getattr(backend, "_state_cache", None)
+                if sc is not None:
+                    mx.eval(
+                        model_output,
+                        *kv.key_caches,
+                        *kv.value_caches,
+                        *sc.conv_states,
+                        *sc.recurrent_states,
+                    )
+                else:
+                    mx.eval(model_output, *kv.key_caches, *kv.value_caches)
+            else:
+                mx.eval(model_output, *kv.key_caches, *kv.value_caches)
+            del model_output
+        finally:
+            clear_context()
+
+        mx.clear_cache()
+
+    def _start_paged_forward_single(
+        self,
+        batch: _ExecutionBatch,
+        prefill_reqs: list[PrefillRequest],
+        decode_reqs: list[tuple[str, RequestState]],
+        scheduler_output: SchedulerOutput,
+    ) -> None:
+        """Single-pass forward (no chunking). Original _start_paged_forward."""
         num_decode = len(decode_reqs)
 
         # ---- build unified token sequence: decode first, then prefill ----
@@ -1515,28 +1665,31 @@ class MetalModelRunner:
         try:
             model_output = self.model(input_ids, cache=offset_caches)
             logits = self._extract_logits(model_output)
-            # MLX uses lazy evaluation — model_output holds the entire
-            # computation graph.  Dropping it before mx.eval lets MLX
-            # free intermediate buffers (per-layer Q/K/V, MLP outputs)
-            # as the graph evaluates, rather than pinning them all.
             del model_output
         finally:
             clear_context()
 
         # Submit to GPU — returns immediately, GPU runs in background.
-        # GDN state writes (conv_states, recurrent_states) are side-effects
-        # outside the logits dependency graph.  They must be included in
-        # async_eval explicitly, otherwise they are silently dropped when
-        # the Python variables are rebound in the next forward pass.
+        # Include KV caches and GDN state arrays explicitly: these are
+        # side-effect writes outside the logits dependency graph that
+        # would be silently dropped if not evaluated before the next
+        # forward pass rebinds the Python references.
+        kv = self._paged_attention_backend.kv_cache
         if self.is_hybrid:
             backend = self._paged_attention_backend
             sc = getattr(backend, "_state_cache", None) if backend else None
             if sc is not None:
-                mx.async_eval(logits, *sc.conv_states, *sc.recurrent_states)
+                mx.async_eval(
+                    logits,
+                    *kv.key_caches,
+                    *kv.value_caches,
+                    *sc.conv_states,
+                    *sc.recurrent_states,
+                )
             else:
-                mx.async_eval(logits)
+                mx.async_eval(logits, *kv.key_caches, *kv.value_caches)
         else:
-            mx.async_eval(logits)
+            mx.async_eval(logits, *kv.key_caches, *kv.value_caches)
 
         # ---- build cu_seqlens for logit extraction ----
         cu_seqlens: list[int] = [0]
